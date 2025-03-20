@@ -18,7 +18,7 @@ use lightning::ln::msgs::{
 use lightning::ln::{PaymentHash, PaymentPreimage};
 use lightning::routing::gossip::{NetworkGraph, NodeId};
 use lightning::routing::router::{find_route, Path, PaymentParameters, Route, RouteParameters};
-use lightning::routing::scoring::ProbabilisticScorer;
+use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringDecayParameters};
 use lightning::routing::utxo::{UtxoLookup, UtxoResult};
 use lightning::util::logger::{Level, Logger, Record};
 use thiserror::Error;
@@ -455,6 +455,7 @@ struct SimNode<'a, T: SimNetwork> {
     in_flight: HashMap<PaymentHash, Receiver<Result<PaymentResult, LightningError>>>,
     /// A read-only graph used for pathfinding.
     pathfinding_graph: Arc<NetworkGraph<&'a WrappedLog>>,
+    scorer: Arc<Mutex<ProbabilisticScorer<Arc<NetworkGraph<&'a WrappedLog>>, &'a WrappedLog>>>,
 }
 
 impl<'a, T: SimNetwork> SimNode<'a, T> {
@@ -465,11 +466,18 @@ impl<'a, T: SimNetwork> SimNode<'a, T> {
         payment_network: Arc<Mutex<T>>,
         pathfinding_graph: Arc<NetworkGraph<&'a WrappedLog>>,
     ) -> Self {
+        let scorer = ProbabilisticScorer::new(
+            ProbabilisticScoringDecayParameters::default(),
+            pathfinding_graph.clone(),
+            &WrappedLog {},
+        );
+
         SimNode {
             info: node_info(pubkey),
             network: payment_network,
             in_flight: HashMap::new(),
             pathfinding_graph,
+            scorer: Arc::new(Mutex::new(scorer)),
         }
     }
 }
@@ -489,14 +497,13 @@ fn node_info(pubkey: PublicKey) -> NodeInfo {
 
 /// Uses LDK's pathfinding algorithm with default parameters to find a path from source to destination, with no
 /// restrictions on fee budget.
-fn find_payment_route(
+fn find_payment_route<'a>(
     source: &PublicKey,
     dest: PublicKey,
     amount_msat: u64,
     pathfinding_graph: &NetworkGraph<&WrappedLog>,
+    scorer: &ProbabilisticScorer<Arc<NetworkGraph<&'a WrappedLog>>, &'a WrappedLog>,
 ) -> Result<Route, SimulationError> {
-    let scorer = ProbabilisticScorer::new(Default::default(), pathfinding_graph, &WrappedLog {});
-
     find_route(
         source,
         &RouteParameters {
@@ -512,7 +519,7 @@ fn find_payment_route(
         pathfinding_graph,
         None,
         &WrappedLog {},
-        &scorer,
+        scorer,
         &Default::default(),
         &[0; 32],
     )
@@ -554,11 +561,15 @@ impl<T: SimNetwork> LightningNode for SimNode<'_, T> {
             },
         }
 
+        // lock the scorer
+        let scorer_guard = self.scorer.lock().await;
+
         let route = match find_payment_route(
             &self.info.pubkey,
             dest,
             amount_msat,
             &self.pathfinding_graph,
+            &scorer_guard,
         ) {
             Ok(path) => path,
             // In the case that we can't find a route for the payment, we still report a successful payment *api call*
