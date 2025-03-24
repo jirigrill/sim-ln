@@ -112,7 +112,7 @@ struct Htlc {
 #[derive(Clone)]
 pub struct ChannelPolicy {
     pub pubkey: PublicKey,
-    pub max_htlc_count: u64,
+    pub max_htlc_count: Option<u64>,
     pub max_in_flight_msat: u64,
     pub min_htlc_size_msat: u64,
     pub max_htlc_size_msat: u64,
@@ -215,9 +215,11 @@ impl ChannelState {
     fn check_outgoing_addition(&self, htlc: &Htlc) -> Result<(), ForwardingError> {
         fail_forwarding_inequality!(htlc.amount_msat, >, self.policy.max_htlc_size_msat, MoreThanMaximum);
         fail_forwarding_inequality!(htlc.amount_msat, <, self.policy.min_htlc_size_msat, LessThanMinimum);
-        fail_forwarding_inequality!(
-            self.in_flight.len() as u64 + 1, >, self.policy.max_htlc_count, ExceedsInFlightCount
-        );
+        if let Some(max_count) = self.policy.max_htlc_count {
+            fail_forwarding_inequality!(
+                self.in_flight.len() as u64 + 1, >, max_count, ExceedsInFlightCount
+            );
+        }
         fail_forwarding_inequality!(
             self.in_flight_total() + htlc.amount_msat, >, self.policy.max_in_flight_msat, ExceedsInFlightTotal
         );
@@ -235,6 +237,15 @@ impl ChannelState {
     /// reported.
     fn add_outgoing_htlc(&mut self, hash: PaymentHash, htlc: Htlc) -> Result<(), ForwardingError> {
         self.check_outgoing_addition(&htlc)?;
+        if let Some(max_count) = self.policy.max_htlc_count {
+            let current_count = self.in_flight.len() as u64;
+            if current_count >= max_count {
+                return Err(ForwardingError::ExceedsInFlightCount(
+                    current_count,
+                    max_count,
+                ));
+            }
+        }
         if self.in_flight.contains_key(&hash) {
             return Err(ForwardingError::PaymentHashExists(hash));
         }
@@ -344,9 +355,10 @@ impl SimulatedChannel {
         }
     }
 
-    /// Adds an htlc to the appropriate side of the simulated channel, checking its policy and balance are okay. The
-    /// public key of the node sending the HTLC (ie, the party that would send update_add_htlc in the protocol)
-    /// must be provided to add the outgoing htlc to its side of the channel.
+    /// Adds an HTLC to the sending node's side of the simulated channel, verifying the node's policy (e.g., HTLC count limits,
+    /// minimum/maximum amounts) and available balance. The `sending_node` public key identifies the node initiating the HTLC
+    /// (equivalent to the sender of an `update_add_htlc` message in the Lightning protocol), determining which side of the
+    /// channel (node_1 or node_2) the HTLC is added to as an outgoing payment.
     fn add_htlc(
         &mut self,
         sending_node: &PublicKey,
@@ -357,8 +369,8 @@ impl SimulatedChannel {
             return Err(ForwardingError::ZeroAmountHtlc);
         }
 
-        self.get_node_mut(sending_node)?
-            .add_outgoing_htlc(hash, htlc)?;
+        let node = self.get_node_mut(sending_node)?;
+        node.add_outgoing_htlc(hash, htlc)?;
         self.sanity_check()
     }
 
@@ -1016,21 +1028,33 @@ async fn propagate_payment(
             hex::encode(payment_hash.0)
         );
 
+        // Map error to specific outcome
+        let outcome = match err {
+            ForwardingError::InsufficientBalance(_, _) => PaymentOutcome::InsufficientBalance,
+            ForwardingError::ChannelNotFound(_) => PaymentOutcome::RouteNotFound,
+            ForwardingError::NodeNotFound(_) => PaymentOutcome::RouteNotFound,
+            ForwardingError::InsufficientFee(_, _, _, _) => PaymentOutcome::InsufficientFee, // Add this
+            ForwardingError::PaymentHashExists(_) => PaymentOutcome::IncorrectPaymentDetails,
+            ForwardingError::PaymentHashNotFound(_) => PaymentOutcome::IncorrectPaymentDetails,
+            ForwardingError::ZeroAmountHtlc => PaymentOutcome::IncorrectPaymentDetails,
+            ForwardingError::LessThanMinimum(_, _) => PaymentOutcome::IncorrectPaymentDetails,
+            ForwardingError::MoreThanMaximum(_, _) => PaymentOutcome::IncorrectPaymentDetails,
+            ForwardingError::ExceedsInFlightCount(_, _) => PaymentOutcome::TooManyHtlcs,
+            ForwardingError::ExceedsInFlightTotal(_, _) => PaymentOutcome::InsufficientBalance,
+            ForwardingError::ExpiryInSeconds(_, _) => PaymentOutcome::PaymentExpired,
+            ForwardingError::InsufficientCltvDelta(_, _) => PaymentOutcome::IncorrectPaymentDetails,
+            ForwardingError::FeeOverflow(_, _, _) => PaymentOutcome::UnexpectedError,
+            ForwardingError::SanityCheckFailed(_, _) => PaymentOutcome::UnexpectedError,
+        };
+
         PaymentResult {
-            htlc_count: 0,
-            payment_outcome: PaymentOutcome::Unknown,
+            htlc_count: fail_idx.map(|idx| idx + 1).unwrap_or(0), // Count HTLCs added
+            payment_outcome: outcome,
         }
     } else {
         // If we successfully added the htlc, go ahead and remove all the htlcs in the route with successful resolution.
-        if let Err(e) = remove_htlcs(
-            nodes,
-            route.hops.len() - 1,
-            source,
-            route,
-            payment_hash,
-            true,
-        )
-        .await
+        let hop_count = route.hops.len();
+        if let Err(e) = remove_htlcs(nodes, hop_count - 1, source, route, payment_hash, true).await
         {
             if e.is_critical() {
                 shutdown.trigger();
@@ -1040,7 +1064,7 @@ async fn propagate_payment(
         }
 
         PaymentResult {
-            htlc_count: 1,
+            htlc_count: hop_count,
             payment_outcome: PaymentOutcome::Success,
         }
     };
@@ -1089,6 +1113,7 @@ mod tests {
     use crate::test_utils::get_random_keypair;
     use bitcoin::secp256k1::PublicKey;
     use lightning::routing::router::Route;
+    use lightning::routing::scoring::ScoreUpdate;
     use mockall::mock;
     use std::time::Duration;
     use tokio::sync::oneshot;
@@ -1100,7 +1125,7 @@ mod tests {
         let (_, pk) = get_random_keypair();
         ChannelPolicy {
             pubkey: pk,
-            max_htlc_count: 10,
+            max_htlc_count: Some(10),
             max_in_flight_msat,
             min_htlc_size_msat: 2,
             max_htlc_size_msat: max_in_flight_msat / 2,
@@ -1127,7 +1152,7 @@ mod tests {
 
             let node_1_to_2 = ChannelPolicy {
                 pubkey: node_1,
-                max_htlc_count: 483,
+                max_htlc_count: Some(483),
                 max_in_flight_msat: capacity_msat / 2,
                 min_htlc_size_msat: 1,
                 max_htlc_size_msat: capacity_msat / 2,
@@ -1138,7 +1163,7 @@ mod tests {
 
             let node_2_to_1 = ChannelPolicy {
                 pubkey: node_2,
-                max_htlc_count: 483,
+                max_htlc_count: Some(483),
                 max_in_flight_msat: capacity_msat / 2,
                 min_htlc_size_msat: 1,
                 max_htlc_size_msat: capacity_msat / 2,
@@ -1344,7 +1369,7 @@ mod tests {
         channel_state.settle_outgoing_htlc(htlc_2.amount_msat, true);
 
         // Now we're going to add many htlcs so that we hit our in-flight count limit (unique payment hash per htlc).
-        for i in 0..channel_state.policy.max_htlc_count {
+        for i in 0..channel_state.policy.max_htlc_count.unwrap_or(0) {
             let hash = PaymentHash([i.try_into().unwrap(); 32]);
             assert!(channel_state.check_outgoing_addition(&htlc).is_ok());
             assert!(channel_state.add_outgoing_htlc(hash, htlc).is_ok());
@@ -1362,7 +1387,7 @@ mod tests {
         ));
 
         // Resolve all in-flight htlcs.
-        for i in 0..channel_state.policy.max_htlc_count {
+        for i in 0..channel_state.policy.max_htlc_count.unwrap_or(0) {
             let hash = PaymentHash([i.try_into().unwrap(); 32]);
             assert!(channel_state.remove_outgoing_htlc(&hash).is_ok());
             channel_state.settle_outgoing_htlc(htlc.amount_msat, true)
@@ -1553,9 +1578,25 @@ mod tests {
     /// Contains elements required to test dispatch_payment functionality.
     struct DispatchPaymentTestKit<'a> {
         graph: SimGraph,
-        nodes: Vec<PublicKey>,
-        routing_graph: NetworkGraph<&'a WrappedLog>,
+        nodes: HashMap<PublicKey, TestNode<'a>>, // Map pubkeys to nodes with scorers
+        node_order: Vec<PublicKey>,              // Stable order: [Alice, Bob, Carol, Dave]
+        routing_graph: Arc<NetworkGraph<&'a WrappedLog>>,
         shutdown: triggered::Trigger,
+    }
+
+    struct TestNode<'a> {
+        scorer: ProbabilisticScorer<Arc<NetworkGraph<&'a WrappedLog>>, &'a WrappedLog>,
+    }
+
+    impl<'a> TestNode<'a> {
+        fn new(graph: Arc<NetworkGraph<&'a WrappedLog>>) -> Self {
+            let scorer = ProbabilisticScorer::new(
+                ProbabilisticScoringDecayParameters::default(),
+                graph.clone(),
+                &WrappedLog {},
+            );
+            TestNode { scorer }
+        }
     }
 
     impl DispatchPaymentTestKit<'_> {
@@ -1569,19 +1610,25 @@ mod tests {
             let (shutdown, _listener) = triggered::trigger();
             let channels = create_simulated_channels(3, capacity);
 
-            // Collect pubkeys in-order, pushing the last node on separately because they don't have an outgoing
-            // channel (they are not node_1 in any channel, only node_2).
-            let mut nodes = channels
-                .iter()
-                .map(|c| c.node_1.policy.pubkey)
-                .collect::<Vec<PublicKey>>();
-            nodes.push(channels.last().unwrap().node_2.policy.pubkey);
+            let routing_graph = Arc::new(populate_network_graph(channels.clone()).unwrap());
+
+            let mut nodes = HashMap::new();
+            let mut node_order = Vec::new();
+            for channel in &channels {
+                let pubkey = channel.node_1.policy.pubkey;
+                nodes.insert(pubkey, TestNode::new(routing_graph.clone()));
+                node_order.push(pubkey);
+            }
+            let last_pubkey = channels.last().unwrap().node_2.policy.pubkey;
+            nodes.insert(last_pubkey, TestNode::new(routing_graph.clone()));
+            node_order.push(last_pubkey);
 
             let kit = DispatchPaymentTestKit {
                 graph: SimGraph::new(channels.clone(), TaskTracker::new(), shutdown.clone())
                     .expect("could not create test graph"),
                 nodes,
-                routing_graph: populate_network_graph(channels).unwrap(),
+                node_order,
+                routing_graph,
                 shutdown,
             };
 
@@ -1592,6 +1639,72 @@ mod tests {
             );
 
             kit
+        }
+
+        async fn new_with_paths(capacity: u64, edges: Vec<(usize, usize)>) -> Self {
+            let (shutdown, _listener) = triggered::trigger();
+
+            let num_nodes = edges.iter().flat_map(|&(a, b)| [a, b]).max().unwrap() + 1;
+            let mut node_order = Vec::with_capacity(num_nodes);
+            for _ in 0..num_nodes {
+                let (_, pubkey) = get_random_keypair();
+                node_order.push(pubkey);
+            }
+
+            let mut channels = Vec::new();
+            for (i, (idx1, idx2)) in edges.iter().enumerate() {
+                let node_1 = node_order[*idx1];
+                let node_2 = node_order[*idx2];
+
+                let node_1_to_2 = ChannelPolicy {
+                    pubkey: node_1,
+                    max_htlc_count: Some(483),
+                    max_in_flight_msat: capacity / 2,
+                    min_htlc_size_msat: 1,
+                    max_htlc_size_msat: capacity / 2,
+                    cltv_expiry_delta: 40 + 10 * i as u32,
+                    base_fee: if *idx1 == 0 && *idx2 == 2 {
+                        1_000_000
+                    } else {
+                        1000 * i as u64
+                    }, // High fee for Alice -> Carol
+                    fee_rate_prop: 1500 * i as u64,
+                };
+
+                let node_2_to_1 = ChannelPolicy {
+                    pubkey: node_2,
+                    max_htlc_count: Some(483),
+                    max_in_flight_msat: capacity / 2,
+                    min_htlc_size_msat: 1,
+                    max_htlc_size_msat: capacity / 2,
+                    cltv_expiry_delta: 40 + 10 * i as u32,
+                    base_fee: 2000 * i as u64,
+                    fee_rate_prop: i as u64,
+                };
+
+                channels.push(SimulatedChannel::new(
+                    capacity,
+                    ShortChannelID::from(i as u64),
+                    node_1_to_2,
+                    node_2_to_1,
+                ));
+            }
+
+            let routing_graph = Arc::new(populate_network_graph(channels.clone()).unwrap());
+
+            let mut nodes = HashMap::new();
+            for pubkey in &node_order {
+                nodes.insert(*pubkey, TestNode::new(routing_graph.clone()));
+            }
+
+            DispatchPaymentTestKit {
+                graph: SimGraph::new(channels, TaskTracker::new(), shutdown.clone())
+                    .expect("could not create test graph"),
+                nodes,
+                node_order,
+                routing_graph,
+                shutdown,
+            }
         }
 
         /// Returns a vector of local/remote channel balances for channels in the network.
@@ -1619,22 +1732,69 @@ mod tests {
 
         // Sends a test payment from source to destination and waits for the payment to complete, returning the route
         // used.
-        async fn send_test_payemnt(
+        async fn send_test_payment(
             &mut self,
             source: PublicKey,
             dest: PublicKey,
             amt: u64,
-        ) -> Route {
-            let route = find_payment_route(&source, dest, amt, &self.routing_graph).unwrap();
+        ) -> Result<Route, String> {
+            let source_node = self.nodes.get_mut(&source).ok_or_else(|| {
+                format!("Source node {} not found", hex::encode(source.to_string()))
+            })?;
+            let route =
+                find_payment_route(&source, dest, amt, &self.routing_graph, &source_node.scorer)
+                    .map_err(|e| format!("Failed to find route: {:?}", e))?;
+            println!("Attempted route: {:?}", route.paths[0].hops);
 
             let (sender, receiver) = oneshot::channel();
             self.graph
                 .dispatch_payment(source, route.clone(), PaymentHash([1; 32]), sender);
 
-            // Assert that we receive from the channel or fail.
-            assert!(timeout(Duration::from_millis(10), receiver).await.is_ok());
+            let result = timeout(Duration::from_millis(10), receiver)
+                .await
+                .map_err(|_| "Payment timed out after 10ms".to_string())?
+                .map_err(|_| "Receiver channel closed unexpectedly".to_string())?;
 
-            route
+            match result {
+                Ok(payment_result) => match payment_result.payment_outcome {
+                    PaymentOutcome::Success => Ok(route),
+                    outcome => {
+                        let failed_scid = route.paths[0]
+                            .hops
+                            .last()
+                            .map(|h| h.short_channel_id)
+                            .unwrap_or(0);
+                        let duration_since_epoch = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or(Duration::from_secs(0));
+                        source_node.scorer.payment_path_failed(
+                            &route.paths[0],
+                            failed_scid,
+                            duration_since_epoch,
+                        );
+                        Err(format!(
+                            "Payment failed with outcome: {:?}, htlc_count: {}",
+                            outcome, payment_result.htlc_count
+                        ))
+                    },
+                },
+                Err(e) => {
+                    let failed_scid = route.paths[0]
+                        .hops
+                        .last()
+                        .map(|h| h.short_channel_id)
+                        .unwrap_or(0);
+                    let duration_since_epoch = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or(Duration::from_secs(0));
+                    source_node.scorer.payment_path_failed(
+                        &route.paths[0],
+                        failed_scid,
+                        duration_since_epoch,
+                    );
+                    Err(format!("Dispatch error: {:?}", e))
+                },
+            }
         }
 
         // Sets the balance on the channel to the tuple provided, used to arrange liquidity for testing.
@@ -1659,8 +1819,9 @@ mod tests {
         // Send a payment that should succeed from Alice -> Dave.
         let mut amt = 20_000;
         let route = test_kit
-            .send_test_payemnt(test_kit.nodes[0], test_kit.nodes[3], amt)
-            .await;
+            .send_test_payment(test_kit.node_order[0], test_kit.node_order[3], amt)
+            .await
+            .unwrap();
 
         let route_total = amt + route.get_total_fees();
         let hop_1_amt = amt + route.paths[0].hops[1].fee_msat;
@@ -1679,7 +1840,7 @@ mod tests {
         // machine, so we want to specifically hit it. To do this, we'll try to send double the amount that we just
         // pushed to Dave back to Bob, expecting a failure on Dave's outgoing link due to insufficient liquidity.
         let _ = test_kit
-            .send_test_payemnt(test_kit.nodes[3], test_kit.nodes[1], amt * 2)
+            .send_test_payment(test_kit.node_order[3], test_kit.node_order[1], amt * 2)
             .await;
         assert_eq!(test_kit.channel_balances().await, expected_balances);
 
@@ -1688,7 +1849,7 @@ mod tests {
         // use 50% of the channel's capacity, so we need to do two payments.
         amt = bob_to_carol.0 / 2;
         let _ = test_kit
-            .send_test_payemnt(test_kit.nodes[1], test_kit.nodes[2], amt)
+            .send_test_payment(test_kit.node_order[1], test_kit.node_order[2], amt)
             .await;
 
         bob_to_carol = (bob_to_carol.0 / 2, bob_to_carol.1 + amt);
@@ -1697,7 +1858,7 @@ mod tests {
 
         // When we push this amount a second time, all the liquidity should be moved to Carol's end.
         let _ = test_kit
-            .send_test_payemnt(test_kit.nodes[1], test_kit.nodes[2], amt)
+            .send_test_payment(test_kit.node_order[1], test_kit.node_order[2], amt)
             .await;
         bob_to_carol = (0, chan_capacity);
         expected_balances = vec![alice_to_bob, bob_to_carol, carol_to_dave];
@@ -1706,7 +1867,7 @@ mod tests {
         // Finally, we'll test a multi-hop failure by trying to send from Alice -> Dave. Since Bob's liquidity is
         // drained, we expect a failure and unchanged balances along the route.
         let _ = test_kit
-            .send_test_payemnt(test_kit.nodes[0], test_kit.nodes[3], 20_000)
+            .send_test_payment(test_kit.node_order[0], test_kit.node_order[3], 20_000)
             .await;
         assert_eq!(test_kit.channel_balances().await, expected_balances);
 
@@ -1724,8 +1885,13 @@ mod tests {
         // Send a payment that should succeed from Alice -> Dave.
         let amt = 20_000;
         let route = test_kit
-            .send_test_payemnt(test_kit.nodes[0], test_kit.nodes[3], amt)
-            .await;
+            .send_test_payment(
+                test_kit.node_order[0], // Alice
+                test_kit.node_order[3], // Dave
+                amt,
+            )
+            .await
+            .expect("Payment should succeed");
 
         let route_total = amt + route.get_total_fees();
         let hop_1_amt = amt + route.paths[0].hops[1].fee_msat;
@@ -1754,7 +1920,7 @@ mod tests {
         // Send a single hop payment from Alice -> Bob, it will succeed because Alice has all the liquidity.
         let amt = 150_000;
         let _ = test_kit
-            .send_test_payemnt(test_kit.nodes[0], test_kit.nodes[1], amt)
+            .send_test_payment(test_kit.node_order[0], test_kit.node_order[1], amt)
             .await;
 
         let expected_balances = vec![
@@ -1767,7 +1933,7 @@ mod tests {
         // Send a single hop payment from Dave -> Carol that will fail due to lack of liquidity, balances should be
         // unchanged.
         let _ = test_kit
-            .send_test_payemnt(test_kit.nodes[3], test_kit.nodes[2], amt)
+            .send_test_payment(test_kit.node_order[3], test_kit.node_order[2], amt)
             .await;
 
         assert_eq!(test_kit.channel_balances().await, expected_balances);
@@ -1795,7 +1961,7 @@ mod tests {
         // Send a payment from Alice -> Dave which we expect to fail leaving balances unaffected.
         let amt = 150_000;
         let _ = test_kit
-            .send_test_payemnt(test_kit.nodes[0], test_kit.nodes[3], amt)
+            .send_test_payment(test_kit.node_order[0], test_kit.node_order[3], amt)
             .await;
 
         assert_eq!(test_kit.channel_balances().await, expected_balances);
@@ -1808,10 +1974,165 @@ mod tests {
             .await;
 
         let _ = test_kit
-            .send_test_payemnt(test_kit.nodes[3], test_kit.nodes[0], amt)
+            .send_test_payment(test_kit.node_order[3], test_kit.node_order[0], amt)
             .await;
 
         assert_eq!(test_kit.channel_balances().await, expected_balances);
+
+        test_kit.shutdown.trigger();
+        test_kit.graph.tasks.close();
+        test_kit.graph.tasks.wait().await;
+    }
+
+    #[tokio::test]
+    async fn test_scorer_penalty() {
+        let chan_capacity = 500_000_000;
+        let mut test_kit = DispatchPaymentTestKit::new_with_paths(
+            chan_capacity,
+            vec![
+                (0, 1), // Alice -> Bob
+                (1, 2), // Bob -> Carol
+                (0, 2), // Alice -> Carol
+            ],
+        )
+        .await;
+
+        test_kit
+            .set_channel_balance(&ShortChannelID::from(1), (0, chan_capacity))
+            .await;
+
+        let first_result = test_kit
+            .send_test_payment(test_kit.node_order[0], test_kit.node_order[2], 20_000)
+            .await;
+        assert!(first_result.is_err(), "First payment should fail");
+
+        let second_result = test_kit
+            .send_test_payment(test_kit.node_order[0], test_kit.node_order[2], 20_000)
+            .await;
+        let second_route = second_result.expect("Retry should succeed via alternative path");
+
+        let hops = &second_route.paths[0].hops;
+        assert_eq!(hops.len(), 1, "Route should be direct");
+        assert_eq!(hops[0].pubkey, test_kit.node_order[2], "Should bypass Bob");
+
+        test_kit.shutdown.trigger();
+        test_kit.graph.tasks.close();
+        test_kit.graph.tasks.wait().await;
+    }
+
+    #[tokio::test]
+    async fn test_scorer_fee_penalty() {
+        let chan_capacity = 500_000_000;
+        let mut test_kit = DispatchPaymentTestKit::new_with_paths(
+            chan_capacity,
+            vec![
+                (0, 1), // Alice -> Bob
+                (1, 2), // Bob -> Carol
+                (0, 2), // Alice -> Carol
+            ],
+        )
+        .await;
+
+        // Modify Bob -> Carol (SCID 1) fee policy
+        let mut channels = test_kit.graph.channels.lock().await;
+        if let Some(channel) = channels.get_mut(&ShortChannelID::from(1)) {
+            channel.node_1.policy.base_fee = 1_000_000; // High fee to fail 20,000 msat payment
+        } else {
+            panic!("Channel SCID 1 not found");
+        }
+        drop(channels);
+
+        let first_result = test_kit
+            .send_test_payment(test_kit.node_order[0], test_kit.node_order[2], 20_000)
+            .await;
+        assert!(
+            first_result.is_err(),
+            "First payment should fail due to fee"
+        );
+        assert!(
+            first_result.unwrap_err().contains("InsufficientFee"),
+            "Should fail with InsufficientFee"
+        );
+
+        let second_result = test_kit
+            .send_test_payment(test_kit.node_order[0], test_kit.node_order[2], 20_000)
+            .await;
+        let second_route = second_result.expect("Retry should succeed");
+        assert_eq!(
+            second_route.paths[0].hops.len(),
+            1,
+            "Route should be direct"
+        );
+        assert_eq!(
+            second_route.paths[0].hops[0].short_channel_id, 2,
+            "Should use Alice -> Carol"
+        );
+
+        test_kit.shutdown.trigger();
+        test_kit.graph.tasks.close();
+        test_kit.graph.tasks.wait().await;
+    }
+
+    #[tokio::test]
+    async fn test_scorer_in_flight_limit() {
+        let chan_capacity = 500_000_000;
+        let mut test_kit = DispatchPaymentTestKit::new_with_paths(
+            chan_capacity,
+            vec![
+                (0, 1), // Alice -> Bob
+                (1, 2), // Bob -> Carol
+                (0, 2), // Alice -> Carol
+            ],
+        )
+        .await;
+
+        // Set SCID 1 (Bob -> Carol) to allow only 1 in-flight HTLC
+        let mut channels = test_kit.graph.channels.lock().await;
+        if let Some(channel) = channels.get_mut(&ShortChannelID::from(1)) {
+            channel.node_1.policy.max_htlc_count = Some(1);
+
+            // Manually add an HTLC to occupy Bob -> Carol's slot
+            let dummy_hash = PaymentHash([0xFF; 32]);
+            let dummy_htlc = Htlc {
+                amount_msat: 10_000,
+                cltv_expiry: 100,
+            };
+            channel
+                .add_htlc(&test_kit.node_order[1], dummy_hash, dummy_htlc)
+                .expect("Failed to add dummy HTLC");
+        } else {
+            panic!("Channel SCID 1 not found");
+        }
+        drop(channels);
+
+        // First payment should fail due to HTLC limit already reached
+        let first_result = test_kit
+            .send_test_payment(test_kit.node_order[0], test_kit.node_order[2], 20_000)
+            .await;
+        assert!(
+            first_result.is_err(),
+            "First payment should fail due to HTLC limit"
+        );
+        assert!(
+            first_result.unwrap_err().contains("TooManyHtlcs"),
+            "Should fail with TooManyHtlcs"
+        );
+
+        // Second payment should reroute via SCID 2
+        let second_result = test_kit
+            .send_test_payment(test_kit.node_order[0], test_kit.node_order[2], 20_000)
+            .await;
+        let second_route =
+            second_result.expect("Second payment should succeed via alternative path");
+        assert_eq!(
+            second_route.paths[0].hops.len(),
+            1,
+            "Route should be direct"
+        );
+        assert_eq!(
+            second_route.paths[0].hops[0].short_channel_id, 2,
+            "Should use Alice -> Carol"
+        );
 
         test_kit.shutdown.trigger();
         test_kit.graph.tasks.close();

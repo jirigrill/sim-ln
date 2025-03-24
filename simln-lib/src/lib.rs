@@ -385,6 +385,8 @@ pub enum PaymentOutcome {
     UnexpectedError,
     IncorrectPaymentDetails,
     InsufficientBalance,
+    InsufficientFee,
+    TooManyHtlcs,
     Unknown,
     NotDispatched,
     TrackPaymentFailed,
